@@ -23,7 +23,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"[{EXPERIMENT_NAME}] Using device: {device}")
 
 K = 5
-rounds = 40
+rounds = 50
 local_epochs = 3  # 降低 local epochs，減少過擬合風險
 batch_size = 128
 lr = 0.002
@@ -273,5 +273,57 @@ axes[2].set_ylabel('mIoU')
 axes[2].grid(True, linestyle='--', alpha=0.6)
 axes[2].legend()
 plt.show()
+
+def visualize_activation_denoising(client, server, dataloader, device):
+    client.model.eval()
+    server.model.eval()
+
+    # 取出一個 batch，並只取第一張圖
+    x, y = next(iter(dataloader))
+    x_single = x[0:1].to(device)
+
+    input_image_raw = x_single.squeeze(0).cpu().permute(1, 2, 0).numpy()
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    input_image_denorm = (input_image_raw * std) + mean
+    input_image_vis = np.clip(input_image_denorm, 0, 1)
+
+    with torch.no_grad():
+        # 1. 原始特徵 (Client 輸出)
+        clean_activations = client.model(x_single)
+
+        # 2. 經過通道加上雜訊
+        noisy_activations = client.channel.transmit(clean_activations)
+
+        # 3. Server 端進行 MMSE 去噪
+        denoised_activations = server.denoiser.denoise(noisy_activations)
+
+    # 將特徵圖轉到 CPU，並取第一個通道 (Channel 0) 進行視覺化
+    clean_vis = clean_activations[0, 0].cpu().numpy()
+    noisy_vis = noisy_activations[0, 0].cpu().numpy()
+    denoised_vis = denoised_activations[0, 0].cpu().numpy()
+
+    # 建立 1x3 的畫布
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    axes[0].imshow(input_image_vis)
+    axes[0].set_title("Original picture")
+    axes[0].axis('off')
+
+    axes[1].imshow(clean_vis, cmap='viridis')
+    axes[1].set_title("Clean Activations (Client Output)")
+    axes[1].axis('off')
+
+    axes[2].imshow(noisy_vis, cmap='viridis')
+    axes[2].set_title(f"Noisy Activations (SNR={client.channel.snr_db:.1f}dB)")
+    axes[2].axis('off')
+
+    axes[3].imshow(denoised_vis, cmap='viridis')
+    axes[3].set_title("Denoised Activations (MMSE)")
+    axes[3].axis('off')
+    plt.show()
+
+print("\n=== Denoising plot generating ===")
+visualize_activation_denoising(clients[0], main_server, test_loader, device)
+
 
 print(f"Finished!")
