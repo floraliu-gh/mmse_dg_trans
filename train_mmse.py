@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
@@ -15,16 +16,16 @@ from server_model import ServerModel
 from client1 import Client    
 from server1 import MainServer  
 from robust_aggregation import fedserver
-from channel_simulation import CommunicationChannel, PixelNoiseInjector, MMSEDenoiser
+from channel_simulation import CommunicationChannel, PixelNoiseInjector
 
-EXPERIMENT_NAME = "MMSE_Denoising"
+EXPERIMENT_NAME = "Hybrid_SNR_EMA_Denoising"
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"[{EXPERIMENT_NAME}] Using device: {device}")
 
 K = 5
 rounds = 50
-local_epochs = 3  # 降低 local epochs，減少過擬合風險
+local_epochs = 3  
 batch_size = 128
 lr = 0.002
 
@@ -39,14 +40,15 @@ BIT_ERROR_RATE = 0.001
 PIXEL_NOISE_STD = 0.05
 
 print(f"\n=== [{EXPERIMENT_NAME}] Settings ===")
-print(f"Channel noise: On (SNR={SNR_DB}dB)")
-print(f"Denoising: MMSE (Wiener Filter, SNR={SNR_DB}dB)")
+print(f"Channel noise: On (Base SNR={SNR_DB}dB)")
+print(f"Denoising 1 (Forward) : Dynamic SNR Weight Scaling on A_k")
+print(f"Denoising 2 (Backward): SNR-Driven EMA on Gradients dA_k")
 print(f"Aggregation method: {AGGREGATION_METHOD}")
 
 print("\nPreparing DeepGlobe dataset...")
 from deepglobe import DeepGlobeDataset
 
-full_dataset = DeepGlobeDataset(root_dir='C:/Users/user/Desktop/Flora/deepglobe', split=None, img_size=(64, 64))
+full_dataset = DeepGlobeDataset(root_dir='C:/Users/winlab/Desktop/Flora/deepglobe', split=None, img_size=(64, 64))
 train_size = int(0.8 * len(full_dataset))
 test_size = len(full_dataset) - train_size
 train_dataset_full, test_dataset = random_split(full_dataset, [train_size, test_size])
@@ -60,23 +62,15 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 channels = []
 pixel_injectors = []
-channel_snrs = []
 for i in range(K):
-    snr_variation = SNR_DB + np.random.randn() * 2
-    channel_snrs.append(snr_variation)
-    channel = CommunicationChannel(snr_db=snr_variation, channel_gain=CHANNEL_GAIN, bit_error_rate=BIT_ERROR_RATE)
+    channel = CommunicationChannel(snr_db=SNR_DB, channel_gain=CHANNEL_GAIN, bit_error_rate=BIT_ERROR_RATE)
     pixel_injector = PixelNoiseInjector(noise_std=PIXEL_NOISE_STD) if ENABLE_PIXEL_NOISE else None
     channels.append(channel)
     pixel_injectors.append(pixel_injector)
 
-# MMSE 去雜訊器：使用平均 SNR 初始化
-avg_snr_init = np.mean(channel_snrs)
-mmse_denoiser = MMSEDenoiser(snr_db=avg_snr_init)
-print(f"MMSE Denoiser initialized with avg SNR = {avg_snr_init:.2f} dB")
-
 global_server_model = ServerModel(num_classes=7).to(device)
 server_lr = 0.001
-main_server = MainServer(global_server_model, device, lr=server_lr, denoiser=mmse_denoiser)
+main_server = MainServer(global_server_model, device, lr=server_lr, denoiser=None)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(main_server.optimizer, T_max=rounds, eta_min=1e-5)
 
 clients = []
@@ -100,12 +94,10 @@ def evaluate(c_model, s_model, loader):
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            print("目前 Batch 的真實標籤包含類別:", torch.unique(y).tolist())
             activations = c_model(x)
             outputs = s_model(activations)
             _, predicted = torch.max(outputs, 1)
             
-            # mask out unknown (class 6)
             valid_mask = y != 6
             total_pixels += valid_mask.sum().item()
             correct_pixels += ((predicted == y) & valid_mask).sum().item()
@@ -131,7 +123,6 @@ print("\n[1] Client Model Parameters & Memory:")
 summary(clients[0].model, input_data=(dummy_client_input,), device=device)
 
 print("\n[2] Server Model Parameters & Memory:")
-#summary(main_server.model, input_data=(dummy_server_input,), device=device)
 
 dummy_client_model = copy.deepcopy(clients[0].model)
 dummy_server_model = copy.deepcopy(main_server.model)
@@ -176,13 +167,19 @@ print(f" - Total Inference Latency: {(client_latency + server_latency):.3f} ms /
 print(f"\nStart training [{EXPERIMENT_NAME}]: Rounds={rounds}, Local Epochs={local_epochs}")
 train_losses, test_accuracies, test_mious = [], [], []
 
-for r in range(rounds):
-    # 每輪根據當前平均 SNR 更新 MMSE 的 Wiener 係數
-    avg_snr = np.mean([ch.snr_db for ch in channels if ch is not None])
-    mmse_denoiser.update_snr(avg_snr)
+# 建立反向梯度的 EMA 緩衝區
+client_grad_ema = {i: None for i in range(K)}
 
-    wiener_w = mmse_denoiser.snr_linear / (mmse_denoiser.snr_linear + 1.0)
-    print(f'\n--- Round {r+1}/{rounds} (MMSE SNR={avg_snr:.2f}dB, Wiener W={wiener_w:.4f}) ---')
+for r in range(rounds):
+    # 每回合動態更新通道 SNR
+    round_snrs = []
+    for i in range(K):
+        new_snr = SNR_DB + np.random.randn() * 2
+        clients[i].channel.snr_db = new_snr
+        round_snrs.append(new_snr)
+    avg_snr = np.mean(round_snrs)
+
+    print(f'\n--- Round {r+1}/{rounds} (Avg SNR={avg_snr:.2f}dB) ---')
     round_loss = 0.0
     total_steps = 0
 
@@ -192,32 +189,52 @@ for r in range(rounds):
                 x, y = x.to(device), y.to(device)
 
                 A_k_received = clients[i].ClientUpdate(x, add_pixel_noise=ENABLE_PIXEL_NOISE)
-
                 A_k_received = torch.nan_to_num(A_k_received, nan=0.0)
-                # 移除過度正規化：不再強制 normalize activation，以保留 MMSE 去雜訊後的特徵分佈
-                A_k_received = torch.clamp(A_k_received, min=-10.0, max=10.0)  # 只做寬鬆的數值保護
+                A_k_received = torch.clamp(A_k_received, min=-10.0, max=10.0)
 
-                A_k_server_input = A_k_received.to(device).detach().clone().requires_grad_(True)
+                # ==========================================
+                # 機制 1：前向傳播的動態 SNR 特徵縮放
+                # ==========================================
+                current_snr = clients[i].channel.snr_db
+                snr_linear = 10 ** (current_snr / 10.0)
+                snr_weight = snr_linear / (snr_linear + 1.0)
+                
+                A_k_denoised = A_k_received * snr_weight
+                A_k_server_input = A_k_denoised.to(device).detach().clone().requires_grad_(True)
 
                 dA_k, loss_val = main_server.ServerUpdate(A_k_server_input, y, clear_grad=True)
-
                 dA_k = torch.clamp(dA_k, min=-0.5, max=0.5)
 
-                clients[i].ClientBackprop(dA_k.clone())
+                # ==========================================
+                # 機制 2：反向傳播的 SNR 驅動梯度 EMA
+                # ==========================================
+                # SNR 越差 (snr_weight 越小)，alpha 越大，越依賴過去健康的梯度
+                ema_alpha = 1.0 - snr_weight 
+                current_b = dA_k.shape[0]  # 取得當下實際的 Batch Size
+                
+                # 解決 Tensor Size Mismatch: 如果是初始狀態，或是遇到最後一個數量不足的 Batch，就重新 clone
+                if client_grad_ema[i] is None or client_grad_ema[i].shape[0] != current_b:
+                    client_grad_ema[i] = dA_k.clone()
+                else:
+                    client_grad_ema[i] = ema_alpha * client_grad_ema[i] + (1.0 - ema_alpha) * dA_k
+                
+                dA_k_smoothed = client_grad_ema[i].clone()
+
+                clients[i].ClientBackprop(dA_k_smoothed)
                 torch.nn.utils.clip_grad_norm_(clients[i].model.parameters(), max_norm=5.0)
 
                 torch.nn.utils.clip_grad_norm_(main_server.model.parameters(), max_norm=5.0)
                 main_server.step()
 
-                # DEBUG 列印區塊 (觀察梯度健康度)
                 if i == 0 and batch_idx == 0:
-                    grad_norm = dA_k.abs().mean().item()
+                    grad_norm = dA_k_smoothed.abs().mean().item()
                     first_layer_grad = 0
                     for param in clients[i].model.parameters():
                         if param.grad is not None:
                             first_layer_grad = param.grad.abs().mean().item()
                             break
-                    print(f"Server回傳梯度={grad_norm:.6e}, Client權重梯度={first_layer_grad:.6f}")
+                    print(f"Client 0 SNR={current_snr:.2f}dB | 前向縮放 W={snr_weight:.4f} | 反向EMA α={ema_alpha:.4f}")
+                    print(f"Server回傳平滑梯度={grad_norm:.6e}, Client權重梯度={first_layer_grad:.6f}")
 
                 round_loss += loss_val
                 total_steps += 1
@@ -247,7 +264,6 @@ print(f'Best mIoU:  {max(test_mious):.4f}')
 
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-# 1. 畫 Training Loss
 axes[0].plot(range(1, rounds + 1), train_losses, marker='o', color='b', markersize=4, label='Train Loss')
 axes[0].set_title('Training Loss over Rounds')
 axes[0].set_xlabel('Communication Rounds')
@@ -255,8 +271,6 @@ axes[0].set_ylabel('Loss')
 axes[0].grid(True, linestyle='--', alpha=0.6)
 axes[0].legend()
 
-# 2. 畫 Pixel Accuracy
-# 將小數轉換為百分比數值方便閱讀
 acc_percent = [acc * 100 for acc in test_accuracies]
 axes[1].plot(range(1, rounds + 1), acc_percent, marker='s', color='g', markersize=4, label='Pixel Accuracy')
 axes[1].set_title('Test Pixel Accuracy over Rounds')
@@ -265,7 +279,6 @@ axes[1].set_ylabel('Accuracy (%)')
 axes[1].grid(True, linestyle='--', alpha=0.6)
 axes[1].legend()
 
-# 3. 畫 mIoU
 axes[2].plot(range(1, rounds + 1), test_mious, marker='^', color='r', markersize=4, label='mIoU')
 axes[2].set_title('Test mIoU over Rounds')
 axes[2].set_xlabel('Communication Rounds')
@@ -274,56 +287,161 @@ axes[2].grid(True, linestyle='--', alpha=0.6)
 axes[2].legend()
 plt.show()
 
-def visualize_activation_denoising(client, server, dataloader, device):
+# ---------------- 視覺化函數 ----------------
+
+class ActivationDecoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 3, kernel_size=2, stride=2),
+            nn.Tanh(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+def visualize_activation_denoising(client, server, dataloader, device, decoder_steps=300):
+    mean_t = torch.tensor([0.344, 0.380, 0.407], device=device).view(1, 3, 1, 1)
+    std_t  = torch.tensor([0.203, 0.136, 0.114], device=device).view(1, 3, 1, 1)
+    mean_np = np.array([0.344, 0.380, 0.407])
+    std_np  = np.array([0.203, 0.136, 0.114])
+
+    def to_display(tensor_img):
+        img = tensor_img.squeeze(0).cpu().permute(1, 2, 0).numpy()
+        img = img * std_np + mean_np
+        return np.clip(img, 0, 1)
+
+    def psnr(recon, target):
+        mse = np.mean((recon.astype(np.float32) - target.astype(np.float32)) ** 2)
+        if mse == 0:
+            return float('inf')
+        return 20 * np.log10(1.0 / np.sqrt(mse))
+
     client.model.eval()
     server.model.eval()
 
-    # 取出一個 batch，並只取第一張圖
-    x, y = next(iter(dataloader))
-    x_single = x[0:1].to(device)
+    x_batch, _ = next(iter(dataloader))
+    x_batch = x_batch.to(device)
+    x_single = x_batch[0:1]
 
-    input_image_raw = x_single.squeeze(0).cpu().permute(1, 2, 0).numpy()
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
-    input_image_denorm = (input_image_raw * std) + mean
-    input_image_vis = np.clip(input_image_denorm, 0, 1)
+    print(f"\n[Decoder Training] ({decoder_steps} steps)...")
+    decoder = ActivationDecoder().to(device)
+    optimizer_d = torch.optim.Adam(decoder.parameters(), lr=1e-3)
+    criterion_d = nn.MSELoss()
+
+    for step in range(decoder_steps):
+        decoder.train()
+        client.model.eval()
+        with torch.no_grad():
+            act = client.model(x_batch)
+        recon = decoder(act)
+        loss_d = criterion_d(recon, x_batch)
+        optimizer_d.zero_grad()
+        loss_d.backward()
+        optimizer_d.step()
+
+    decoder.eval()
 
     with torch.no_grad():
-        # 1. 原始特徵 (Client 輸出)
-        clean_activations = client.model(x_single)
+        clean_act    = client.model(x_single)
+        noisy_act    = client.channel.transmit(clean_act)
 
-        # 2. 經過通道加上雜訊
-        noisy_activations = client.channel.transmit(clean_activations)
+        current_snr = client.channel.snr_db
+        snr_linear = 10 ** (current_snr / 10.0)
+        snr_weight = snr_linear / (snr_linear + 1.0)
+        denoised_act = noisy_act * snr_weight
 
-        # 3. Server 端進行 MMSE 去噪
-        denoised_activations = server.denoiser.denoise(noisy_activations)
+    with torch.no_grad():
+        recon_clean    = decoder(clean_act)
+        recon_noisy    = decoder(noisy_act)
+        recon_denoised = decoder(denoised_act)
 
-    # 將特徵圖轉到 CPU，並取第一個通道 (Channel 0) 進行視覺化
-    clean_vis = clean_activations[0, 0].cpu().numpy()
-    noisy_vis = noisy_activations[0, 0].cpu().numpy()
-    denoised_vis = denoised_activations[0, 0].cpu().numpy()
+    orig_vis      = to_display(x_single)
+    vis_clean     = to_display(recon_clean)
+    vis_noisy     = to_display(recon_noisy)
+    vis_denoised  = to_display(recon_denoised)
 
-    # 建立 1x3 的畫布
+    psnr_clean    = psnr(vis_clean,    orig_vis)
+    psnr_noisy    = psnr(vis_noisy,    orig_vis)
+    psnr_denoised = psnr(vis_denoised, orig_vis)
+
+    delta_psnr = psnr_denoised - psnr_noisy
+
     fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-    axes[0].imshow(input_image_vis)
-    axes[0].set_title("Original picture")
-    axes[0].axis('off')
+    fig.suptitle(f'Activation Reconstruction Comparison (SNR={client.channel.snr_db:.1f}dB)', fontsize=13)
 
-    axes[1].imshow(clean_vis, cmap='viridis')
-    axes[1].set_title("Clean Activations (Client Output)")
-    axes[1].axis('off')
+    panels = [
+        (orig_vis,     'Original Input',                           'black'),
+        (vis_clean,    f'Reconstructed: Clean\nPSNR={psnr_clean:.1f}dB',    'green'),
+        (vis_noisy,    f'Reconstructed: Noisy\nPSNR={psnr_noisy:.1f}dB',    'red'),
+        (vis_denoised, f'Reconstructed: SNR Scaled\nPSNR={psnr_denoised:.1f}dB  (Δ{delta_psnr:+.1f}dB)', 'royalblue'),
+    ]
 
-    axes[2].imshow(noisy_vis, cmap='viridis')
-    axes[2].set_title(f"Noisy Activations (SNR={client.channel.snr_db:.1f}dB)")
-    axes[2].axis('off')
+    for ax, (img, title, color) in zip(axes, panels):
+        ax.imshow(img)
+        ax.set_title(title, fontsize=10, color=color, fontweight='bold')
+        ax.axis('off')
+        for spine in ax.spines.values():
+            spine.set_edgecolor(color)
+            spine.set_linewidth(3)
+            spine.set_visible(True)
 
-    axes[3].imshow(denoised_vis, cmap='viridis')
-    axes[3].set_title("Denoised Activations (MMSE)")
-    axes[3].axis('off')
+    plt.tight_layout()
     plt.show()
 
-print("\n=== Denoising plot generating ===")
+def visualize_feature_maps(client, dataloader, device, num_channels=8):
+    client.model.eval()
+
+    x_batch, _ = next(iter(dataloader))
+    x_single = x_batch[0:1].to(device)
+
+    with torch.no_grad():
+        clean_act = client.model(x_single)
+        noisy_act = client.channel.transmit(clean_act.clone())
+
+        current_snr = client.channel.snr_db
+        snr_linear = 10 ** (current_snr / 10.0)
+        snr_weight = snr_linear / (snr_linear + 1.0)
+        denoised_act = noisy_act.clone() * snr_weight
+
+    def act_np(t):
+        return t.squeeze(0).cpu().numpy()
+
+    clean_np    = act_np(clean_act)[:num_channels]
+    noisy_np    = act_np(noisy_act)[:num_channels]
+    denoised_np = act_np(denoised_act)[:num_channels]
+
+    total_C = clean_np.shape[0]
+    labels  = ['Clean', 'Noisy', 'SNR Scaled']
+    arrays  = [clean_np, noisy_np, denoised_np]
+    colors  = ['green', 'red', 'royalblue']
+
+    fig1, axes1 = plt.subplots(3, total_C, figsize=(2.5 * total_C, 8), constrained_layout=True)
+    fig1.suptitle(f'Feature Map Visualization (first {total_C} channels, SNR={client.channel.snr_db:.1f}dB)', fontsize=13)
+
+    for row_idx, (arr, label, col) in enumerate(zip(arrays, labels, colors)):
+        for ch in range(total_C):
+            ax = axes1[row_idx, ch]
+            im = ax.imshow(arr[ch], cmap='viridis', aspect='auto')
+            if ch == 0:
+                ax.set_ylabel(label, fontsize=10, color=col, fontweight='bold')
+            ax.set_title(f'ch {ch}', fontsize=8)
+            ax.axis('off')
+            for spine in ax.spines.values():
+                spine.set_edgecolor(col)
+                spine.set_linewidth(2.5)
+                spine.set_visible(True)
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    plt.show()
+
+print("\n=== 去噪還原特徵圖 (影像) ===")
 visualize_activation_denoising(clients[0], main_server, test_loader, device)
 
+print("\n=== 特徵圖 (Feature Map) 視覺化 ===")
+visualize_feature_maps(clients[0], test_loader, device, num_channels=8)
 
 print(f"Finished!")
