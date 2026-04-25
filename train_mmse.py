@@ -34,10 +34,15 @@ ENABLE_PIXEL_NOISE = False
 
 AGGREGATION_METHOD = 'fedavg'
 
-SNR_DB = 15
+SNR_DB = 5
 CHANNEL_GAIN = 1.0
 BIT_ERROR_RATE = 0.001
 PIXEL_NOISE_STD = 0.05
+
+# 實驗控制面板
+SIMULATE_IDEAL_CHANNEL = False  # 是否模擬「無雜訊」的天花板環境
+ENABLE_FORWARD_SCALING = False   # 是否開啟前向特徵 SNR 縮放
+ENABLE_BACKWARD_EMA    = False   # 是否開啟反向梯度 SNR EMA
 
 print(f"\n=== [{EXPERIMENT_NAME}] Settings ===")
 print(f"Channel noise: On (Base SNR={SNR_DB}dB)")
@@ -172,9 +177,15 @@ client_grad_ema = {i: None for i in range(K)}
 
 for r in range(rounds):
     # 每回合動態更新通道 SNR
+    # 每回合動態更新通道 SNR
     round_snrs = []
     for i in range(K):
-        new_snr = SNR_DB + np.random.randn() * 2
+        # 【修改點 A】：判斷是否為無雜訊的理想環境
+        if SIMULATE_IDEAL_CHANNEL:
+            new_snr = 100.0  # 100dB 視同完全無雜訊
+        else:
+            new_snr = SNR_DB + np.random.randn() * 2
+            
         clients[i].channel.snr_db = new_snr
         round_snrs.append(new_snr)
     avg_snr = np.mean(round_snrs)
@@ -197,9 +208,12 @@ for r in range(rounds):
                 # ==========================================
                 current_snr = clients[i].channel.snr_db
                 snr_linear = 10 ** (current_snr / 10.0)
-                snr_weight = snr_linear / (snr_linear + 1.0)
+                base_snr_weight = snr_linear / (snr_linear + 1.0)
                 
-                A_k_denoised = A_k_received * snr_weight
+                # 【修改點 B】：如果前向防禦關閉，權重強制設為 1.0 (不縮放)
+                actual_forward_weight = base_snr_weight if ENABLE_FORWARD_SCALING else 1.0
+                
+                A_k_denoised = A_k_received * actual_forward_weight
                 A_k_server_input = A_k_denoised.to(device).detach().clone().requires_grad_(True)
 
                 dA_k, loss_val = main_server.ServerUpdate(A_k_server_input, y, clear_grad=True)
@@ -208,15 +222,14 @@ for r in range(rounds):
                 # ==========================================
                 # 機制 2：反向傳播的 SNR 驅動梯度 EMA
                 # ==========================================
-                # SNR 越差 (snr_weight 越小)，alpha 越大，越依賴過去健康的梯度
-                ema_alpha = 1.0 - snr_weight 
-                current_b = dA_k.shape[0]  # 取得當下實際的 Batch Size
+                # 【修改點 C】：如果反向防禦關閉，alpha 強制設為 0.0 (只看當下梯度，不看歷史)
+                actual_ema_alpha = (1.0 - base_snr_weight) if ENABLE_BACKWARD_EMA else 0.0
+                current_b = dA_k.shape[0] 
                 
-                # 解決 Tensor Size Mismatch: 如果是初始狀態，或是遇到最後一個數量不足的 Batch，就重新 clone
                 if client_grad_ema[i] is None or client_grad_ema[i].shape[0] != current_b:
                     client_grad_ema[i] = dA_k.clone()
                 else:
-                    client_grad_ema[i] = ema_alpha * client_grad_ema[i] + (1.0 - ema_alpha) * dA_k
+                    client_grad_ema[i] = actual_ema_alpha * client_grad_ema[i] + (1.0 - actual_ema_alpha) * dA_k
                 
                 dA_k_smoothed = client_grad_ema[i].clone()
 
@@ -233,7 +246,7 @@ for r in range(rounds):
                         if param.grad is not None:
                             first_layer_grad = param.grad.abs().mean().item()
                             break
-                    print(f"Client 0 SNR={current_snr:.2f}dB | 前向縮放 W={snr_weight:.4f} | 反向EMA α={ema_alpha:.4f}")
+                    print(f"Client 0 SNR={current_snr:.2f}dB | 前向縮放 W={actual_forward_weight:.4f} | 反向EMA α={actual_ema_alpha:.4f}")
                     print(f"Server回傳平滑梯度={grad_norm:.6e}, Client權重梯度={first_layer_grad:.6f}")
 
                 round_loss += loss_val
@@ -438,10 +451,10 @@ def visualize_feature_maps(client, dataloader, device, num_channels=8):
 
     plt.show()
 
-print("\n=== 去噪還原特徵圖 (影像) ===")
+print("\n=== 去噪還原特徵圖 ===")
 visualize_activation_denoising(clients[0], main_server, test_loader, device)
 
-print("\n=== 特徵圖 (Feature Map) 視覺化 ===")
+print("\n=== Visualizing Feature Map ===")
 visualize_feature_maps(clients[0], test_loader, device, num_channels=8)
 
 print(f"Finished!")
